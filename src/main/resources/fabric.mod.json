@@ -1,0 +1,43 @@
+{
+	"schemaVersion": 1,
+	"id": "worlddownloader",
+	"version": "${version}",
+	"name": "World Downloader²",
+	"description": "Download worlds from multiplayer servers (and singleplayer) as a normal, playable save – including chests and entities.",
+	"authors": [
+		"benjamy"
+	],
+	"contact": {
+		"homepage": "https://modrinth.com/mod/worlddownloader",
+		"sources": "https://github.com/bxnjxmin27/WorldDownloader",
+		"issues": "https://github.com/bxnjxmin27/WorldDownloader/issues"
+	},
+	"license": "MIT",
+	"accessWidener": "worlddownloader.accesswidener",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"net.benjamy.worlddownloader.WorldDownloaderClient"
+		],
+		"modmenu": [
+			"net.benjamy.worlddownloader.ModMenuIntegration"
+		]
+	},
+	"mixins": [
+		{
+			"config": "worlddownloader.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.18.4",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"fabric-api": "*"
+	},
+	"custom": {
+		"modmenu": {
+			"icon": "assets/worlddownloader/icon.png"
+		}
+	}
+}

@@ -1,0 +1,23 @@
+{
+  "required": true,
+  "package": "net.benjamy.worlddownloader.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "ClientChunkManagerMixin",
+    "BlockInteractionMixin",
+    "ChunkDataPacketAccessor",
+    "ContainerMixin",
+    "HandledScreenMixin",
+    "DebugContainerMixin",
+    "SelectWorldScreenMixin",
+    "TitleScreenMixin",
+    "WorldEntryMixin",
+    "LevelStorageMixin",
+    "ClientPlayNetworkHandlerMixin",
+    "ServerResourcePackManagerMixin",
+    "WorldListWidgetMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
