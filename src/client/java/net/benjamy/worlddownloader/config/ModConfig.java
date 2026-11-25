@@ -24,7 +24,7 @@ public class ModConfig {
 
     // Export Settings
     private boolean exportWithTexturePack = true;
-    private boolean saveContainers = false;
+    private boolean saveContainers = true;
 
     private static ModConfig instance;
 
@@ -141,7 +141,7 @@ public class ModConfig {
                 exportWithTexturePack = nbt.getBoolean("ExportWithTexturePack").orElse(true);
             }
             if (nbt.contains("SaveContainers")) {
-                saveContainers = nbt.getBoolean("SaveContainers").orElse(false);
+                saveContainers = nbt.getBoolean("SaveContainers").orElse(true);
             }
             if (nbt.contains("AutoStartServer")) {
                 autoStartServer = nbt.getBoolean("AutoStartServer").orElse(false);
@@ -160,7 +160,7 @@ public class ModConfig {
         autoStartServer = false;
         autoStartSingleplayer = false;
         exportWithTexturePack = true;
-        saveContainers = false;
+        saveContainers = true;
         save();
     }
 }

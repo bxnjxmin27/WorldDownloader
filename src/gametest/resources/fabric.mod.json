@@ -1,0 +1,15 @@
+{
+	"schemaVersion": 1,
+	"id": "worlddownloader-gametest",
+	"version": "1.0.0",
+	"name": "World Downloader Gametest",
+	"environment": "client",
+	"entrypoints": {
+		"fabric-client-gametest": [
+			"net.benjamy.worlddownloader.test.WorldDownloaderGameTest"
+		]
+	},
+	"depends": {
+		"worlddownloader": "*"
+	}
+}

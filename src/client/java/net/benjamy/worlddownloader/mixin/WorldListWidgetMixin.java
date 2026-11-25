@@ -23,7 +23,9 @@ public abstract class WorldListWidgetMixin {
         at = @At(value = "INVOKE", target = "Lnet/minecraft/client/gui/screen/world/CreateWorldScreen;show(Lnet/minecraft/client/MinecraftClient;Ljava/lang/Runnable;)V")
     )
     private void preventAutoCreateWorldOnEmptyList(MinecraftClient client, Runnable onCancel) {
-        // Niemals automatisch CreateWorldScreen öffnen
-        // Der Nutzer kann über den "Create New World" Button eine Welt erstellen
+        // Nur in der "Downloaded Worlds"-Ansicht unterdrücken — normal verhält sich Vanilla wie immer
+        if (!WorldFolderManager.isDownloadedWorldsActive()) {
+            CreateWorldScreen.show(client, onCancel);
+        }
     }
 }

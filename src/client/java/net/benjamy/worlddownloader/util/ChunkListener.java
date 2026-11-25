@@ -3,177 +3,174 @@ package net.benjamy.worlddownloader.util;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.registry.RegistryKey;
 import net.minecraft.util.math.ChunkPos;
+import net.minecraft.world.World;
+import net.minecraft.world.chunk.ChunkStatus;
+import net.minecraft.world.chunk.WorldChunk;
+import net.minecraft.world.dimension.DimensionType;
 
 import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.DeflaterOutputStream;
 
+/**
+ * Hält die aufgezeichneten Chunks — getrennt pro Dimension — und schreibt sie als Anvil-Region-Dateien.
+ */
 @Environment(EnvType.CLIENT)
 public class ChunkListener {
 
-    private static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm");
+    private static final int SECTOR_BYTES = 4096;
+    /** Vanilla RegionFile: Bit 128 im Compression-Byte = Chunk liegt in externer c.X.Z.mcc-Datei. */
+    private static final int EXTERNAL_FLAG = 128;
+    private static final int ZLIB = 2;
 
-    private static final ConcurrentHashMap<ChunkPos, NbtCompound> chunkNbtCache = new ConcurrentHashMap<>();
-    private static final AtomicInteger chunkCount = new AtomicInteger(0);
-    private static volatile int dataVersion = 4671;
-    private static volatile Path worldFolder;
-    private static volatile Path regionDir;
-    private static final Object initLock = new Object();
+    private static volatile Map<RegistryKey<World>, Map<ChunkPos, NbtCompound>> cache = new ConcurrentHashMap<>();
 
-    public static void addChunkNbt(ChunkPos chunkPos, NbtCompound chunkNbt) {
-        var v = chunkNbt.getInt("DataVersion");
-        if (v.isPresent() && v.get() != 0) {
-            dataVersion = v.get();
+    // -------------------------------------------------------------------------
+    // Aufzeichnen
+    // -------------------------------------------------------------------------
+
+    /** Serialisiert den aktuellen Zustand eines Chunks und legt ihn in den Cache (überschreibt ältere Stände). */
+    public static void capture(ClientWorld world, WorldChunk chunk) {
+        if (world == null || chunk == null) return;
+        try {
+            NbtCompound nbt = ClientChunkSerializer.serialize(world, chunk);
+            cache.computeIfAbsent(world.getRegistryKey(), k -> new ConcurrentHashMap<>()).put(chunk.getPos(), nbt);
+        } catch (Exception e) {
+            System.out.println("[WorldDownloader] Failed to capture chunk " + chunk.getPos() + ": " + e.getMessage());
         }
+    }
 
-        boolean isNew = chunkNbtCache.put(chunkPos, chunkNbt) == null;
-        if (isNew) {
-            chunkCount.incrementAndGet();
-        }
+    /** Erfasst alle aktuell im Client geladenen Chunks (z. B. beim Start, Stop, Export oder Dimensionswechsel). */
+    public static int captureLoadedChunks(MinecraftClient client) {
+        ClientWorld world = client.world;
+        if (world == null || client.player == null) return 0;
 
-        // Export-Ordner beim ersten Chunk anlegen
-        if (worldFolder == null) {
-            synchronized (initLock) {
-                if (worldFolder == null) {
-                    String exportName = "Export_" + LocalDateTime.now().format(TIMESTAMP);
-                    worldFolder = MinecraftClient.getInstance().runDirectory.toPath()
-                            .resolve("downloaded_worlds")
-                            .resolve(exportName);
-                    regionDir = worldFolder.resolve("region");
-                    try {
-                        Files.createDirectories(regionDir);
-                    } catch (IOException e) {
-                        System.out.println("[WD] Failed to create region directory: " + e.getMessage());
-                    }
-                    System.out.println("[WorldDownloader] Export folder: " + worldFolder);
+        var chunkManager = world.getChunkManager();
+        ChunkPos center = client.player.getChunkPos();
+        int radius = Math.min(48, client.options.getViewDistance().getValue() + 16);
+        int count = 0;
+
+        for (int x = center.x - radius; x <= center.x + radius; x++) {
+            for (int z = center.z - radius; z <= center.z + radius; z++) {
+                WorldChunk chunk = chunkManager.getChunk(x, z, ChunkStatus.FULL, false);
+                if (chunk != null) {
+                    capture(world, chunk);
+                    count++;
                 }
             }
         }
+        return count;
     }
 
+    // -------------------------------------------------------------------------
+    // Export
+    // -------------------------------------------------------------------------
+
     /**
-     * Schreibt alle gecachten Chunks als MCA-Dateien.
-     * Läuft direkt auf dem aufrufenden Thread (WD-ExportThread).
+     * Nimmt alle gecachten Chunks heraus und setzt den Cache zurück.
+     * So kann die Aufnahme weiterlaufen, während der Export-Thread schreibt.
      */
-    public static void flush() throws IOException {
-        Path currentRegionDir = regionDir; // lokale Kopie — schützt gegen concurrent clear()
-        if (chunkNbtCache.isEmpty() || currentRegionDir == null) return;
+    public static Map<RegistryKey<World>, Map<ChunkPos, NbtCompound>> drain() {
+        Map<RegistryKey<World>, Map<ChunkPos, NbtCompound>> old = cache;
+        cache = new ConcurrentHashMap<>();
+        return old;
+    }
+
+    /** Schreibt die Chunks jeder Dimension in deren Vanilla-Ordner (region/, DIM-1/region/, DIM1/region/ …). */
+    public static void writeRegions(Path worldFolder, Map<RegistryKey<World>, Map<ChunkPos, NbtCompound>> chunks) throws IOException {
+        for (var dim : chunks.entrySet()) {
+            Path regionDir = DimensionType.getSaveDirectory(dim.getKey(), worldFolder).resolve("region");
+            writeGroupedByRegion(regionDir, dim.getValue());
+        }
+    }
+
+    /** Gruppiert Chunks nach 32x32-Region und schreibt je eine r.X.Z.mca. */
+    public static void writeGroupedByRegion(Path dir, Map<ChunkPos, NbtCompound> chunks) throws IOException {
+        if (chunks.isEmpty()) return;
+        Files.createDirectories(dir);
 
         Map<Long, Map<ChunkPos, NbtCompound>> regions = new HashMap<>();
-        for (Map.Entry<ChunkPos, NbtCompound> entry : chunkNbtCache.entrySet()) {
+        for (var entry : chunks.entrySet()) {
             ChunkPos pos = entry.getKey();
-            int rx = Math.floorDiv(pos.x, 32);
-            int rz = Math.floorDiv(pos.z, 32);
-            long key = ((long) rx << 32) | (rz & 0xFFFFFFFFL);
+            long key = ChunkPos.toLong(pos.getRegionX(), pos.getRegionZ());
             regions.computeIfAbsent(key, k -> new HashMap<>()).put(pos, entry.getValue());
         }
 
-        for (Map.Entry<Long, Map<ChunkPos, NbtCompound>> regionEntry : regions.entrySet()) {
-            long key = regionEntry.getKey();
-            int rx = (int) (key >> 32);
-            int rz = (int) key;
-            Path path = currentRegionDir.resolve(String.format("r.%d.%d.mca", rx, rz));
-            writeMcaFile(path, regionEntry.getValue());
+        for (var region : regions.entrySet()) {
+            int rx = ChunkPos.getPackedX(region.getKey());
+            int rz = ChunkPos.getPackedZ(region.getKey());
+            writeMcaFile(dir, dir.resolve("r." + rx + "." + rz + ".mca"), region.getValue());
         }
-
-        System.out.println("[WorldDownloader] Flushed " + chunkCount.get() + " chunks to "
-                + regions.size() + " region file(s).");
     }
 
     /**
-     * Schreibt eine einzelne MCA-Datei (Anvil-Format).
+     * Schreibt eine MCA-Datei im Anvil-Format (wie net.minecraft.world.storage.RegionFile).
+     * Chunks, die größer als 255 Sektoren (~1 MB) sind, landen wie in Vanilla in einer externen c.X.Z.mcc.
      */
-    public static void writeMcaFile(Path path, Map<ChunkPos, NbtCompound> chunks) throws IOException {
-        record CompressedChunk(int localX, int localZ, byte[] data) {}
-        List<CompressedChunk> compressed = new ArrayList<>();
+    private static void writeMcaFile(Path dir, Path path, Map<ChunkPos, NbtCompound> chunks) throws IOException {
+        record Entry(int index, byte[] data, boolean external) {}
+        List<Entry> entries = new ArrayList<>();
 
-        for (Map.Entry<ChunkPos, NbtCompound> entry : chunks.entrySet()) {
-            ChunkPos pos = entry.getKey();
-            int localX = Math.floorMod(pos.x, 32);
-            int localZ = Math.floorMod(pos.z, 32);
-
+        for (var e : chunks.entrySet()) {
+            ChunkPos pos = e.getKey();
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            try (DeflaterOutputStream deflate = new DeflaterOutputStream(baos)) {
-                NbtIo.write(entry.getValue(), new DataOutputStream(deflate));
+            try (DataOutputStream out = new DataOutputStream(new DeflaterOutputStream(baos))) {
+                NbtIo.writeCompound(e.getValue(), out);
             }
-            compressed.add(new CompressedChunk(localX, localZ, baos.toByteArray()));
-        }
+            byte[] data = baos.toByteArray();
+            int index = Math.floorMod(pos.x, 32) + Math.floorMod(pos.z, 32) * 32;
 
-        // Sektoren zuweisen — Sektor 0 + 1 = 8192-Byte-Header
-        int[] locationTable = new int[1024]; // (offset << 8) | sectorCount
-        record SectorInfo(int offset, byte[] data) {}
-        Map<Integer, SectorInfo> sectorMap = new HashMap<>();
-
-        int currentSector = 2;
-        for (CompressedChunk cc : compressed) {
-            int totalBytes = 5 + cc.data().length; // 4 Bytes Länge + 1 Byte Compression-Type + Daten
-            int sectors = (totalBytes + 4095) / 4096;
-            int index = cc.localZ() * 32 + cc.localX();
-            locationTable[index] = (currentSector << 8) | Math.min(sectors, 255);
-            sectorMap.put(index, new SectorInfo(currentSector, cc.data()));
-            currentSector += sectors;
+            boolean external = sectorsFor(5 + data.length) > 255;
+            if (external) {
+                Files.write(dir.resolve("c." + pos.x + "." + pos.z + ".mcc"), data);
+            }
+            entries.add(new Entry(index, data, external));
         }
 
         try (RandomAccessFile raf = new RandomAccessFile(path.toFile(), "rw")) {
             raf.setLength(0);
+            int[] locations = new int[1024];
+            int sector = 2; // Sektor 0 = Locations, Sektor 1 = Timestamps
+            int timestamp = (int) (System.currentTimeMillis() / 1000L);
 
-            // Location-Tabelle (4096 Bytes)
-            for (int i = 0; i < 1024; i++) {
-                raf.writeInt(locationTable[i]);
-            }
-            // Timestamp-Tabelle (4096 Bytes, alle 0)
-            for (int i = 0; i < 1024; i++) {
-                raf.writeInt(0);
-            }
+            for (Entry e : entries) {
+                int payload = e.external() ? 1 : e.data().length + 1;
+                int sectors = sectorsFor(4 + payload);
+                locations[e.index()] = (sector << 8) | sectors;
 
-            // Chunk-Daten sektor-aligned schreiben
-            for (Map.Entry<Integer, SectorInfo> entry : sectorMap.entrySet()) {
-                SectorInfo si = entry.getValue();
-                raf.seek((long) si.offset() * 4096);
-                raf.writeInt(si.data().length + 1); // Länge inkl. Compression-Byte
-                raf.writeByte(2);                   // Zlib
-                raf.write(si.data());
-
-                // Auf Sektorgrenze auffüllen
-                int written = 5 + si.data().length;
-                int pad = (4096 - (written % 4096)) % 4096;
-                if (pad > 0) {
-                    raf.write(new byte[pad]);
-                }
+                raf.seek((long) sector * SECTOR_BYTES);
+                raf.writeInt(payload);
+                raf.writeByte(e.external() ? (ZLIB | EXTERNAL_FLAG) : ZLIB);
+                if (!e.external()) raf.write(e.data());
+                sector += sectors;
             }
+            raf.setLength((long) sector * SECTOR_BYTES); // letzten Sektor auffüllen
+
+            raf.seek(0);
+            for (int loc : locations) raf.writeInt(loc);
+            for (int loc : locations) raf.writeInt(loc != 0 ? timestamp : 0);
         }
     }
 
+    private static int sectorsFor(int bytes) {
+        return (bytes + SECTOR_BYTES - 1) / SECTOR_BYTES;
+    }
+
+    // -------------------------------------------------------------------------
+
     public static int getChunkCount() {
-        return chunkCount.get();
-    }
-
-    public static int getDataVersion() {
-        return dataVersion;
-    }
-
-    public static Path getWorldFolder() {
-        return worldFolder;
-    }
-
-    public static NbtCompound getCachedChunkNbt(ChunkPos pos) {
-        return chunkNbtCache.get(pos);
+        return cache.values().stream().mapToInt(Map::size).sum();
     }
 
     public static void clear() {
-        chunkNbtCache.clear();
-        chunkCount.set(0);
-        dataVersion = 4671;
-        worldFolder = null;
-        regionDir = null;
+        cache = new ConcurrentHashMap<>();
     }
 }

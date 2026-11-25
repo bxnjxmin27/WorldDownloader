@@ -2,219 +2,101 @@ package net.benjamy.worlddownloader.util;
 
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
-import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
-import net.minecraft.entity.ItemEntity;
-import net.minecraft.entity.LivingEntity;
-import net.minecraft.entity.mob.MobEntity;
-import net.minecraft.entity.passive.AnimalEntity;
+import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.nbt.NbtCompound;
-import net.minecraft.nbt.NbtDouble;
-import net.minecraft.nbt.NbtFloat;
+import net.minecraft.nbt.NbtHelper;
 import net.minecraft.nbt.NbtList;
-import net.minecraft.registry.Registries;
+import net.minecraft.registry.RegistryKey;
+import net.minecraft.storage.NbtWriteView;
+import net.minecraft.util.ErrorReporter;
 import net.minecraft.util.math.ChunkPos;
-import net.minecraft.util.math.MathHelper;
+import net.minecraft.world.World;
+import net.minecraft.world.dimension.DimensionType;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Speichert Entities mit Vanillas eigener Speicherlogik (Entity#saveData) — also im aktuellen Format
+ * inklusive Ausrüstung, Namen, Varianten, Item-Frames, Gemälden, Rüstungsständern und Passagieren.
+ * Entities werden pro Dimension und UUID gehalten; ein neuer Stand überschreibt den alten.
+ */
 @Environment(EnvType.CLIENT)
 public class EntityTracker {
 
-    private static final Map<ChunkPos, List<NbtCompound>> entities = new ConcurrentHashMap<>();
+    public record Captured(ChunkPos chunk, NbtCompound nbt) {}
 
-    public static void captureAllEntities(MinecraftClient client) {
-        if (client.world == null) {
-            System.out.println(" ClientWorld is null, cannot capture entities");
-            return;
+    private static volatile Map<RegistryKey<World>, Map<UUID, Captured>> cache = new ConcurrentHashMap<>();
+
+    public static void captureAll(ClientWorld world) {
+        if (world == null) return;
+        for (Entity entity : world.getEntities()) {
+            capture(world, entity);
         }
-
-        entities.clear();
-        int totalEntities = 0;
-
-        System.out.println(" Starting entity capture...");
-        for (Entity entity : client.world.getEntities()) {
-            try {
-                NbtCompound entityNbt = serializeEntity(entity, client);
-                if (entityNbt == null) continue;
-
-                ChunkPos chunkPos = new ChunkPos(
-                        MathHelper.floor(entity.getX()) >> 4,
-                        MathHelper.floor(entity.getZ()) >> 4
-                );
-
-                entities.computeIfAbsent(chunkPos, k -> new ArrayList<>()).add(entityNbt);
-                totalEntities++;
-            } catch (Exception e) {
-                System.out.println(" Failed to serialize entity " + entity + ": " + e.getMessage());
-            }
-        }
-
-        System.out.println(" Captured " + totalEntities + " entities across " + entities.size() + " chunks");
     }
 
-    private static NbtCompound serializeEntity(Entity entity, MinecraftClient client) {
-        var entityTypeId = Registries.ENTITY_TYPE.getId(entity.getType());
-        if (entityTypeId == null) return null;
-
-        NbtCompound nbt = new NbtCompound();
-        nbt.putString("id", entityTypeId.toString());
-
-        // Position
-        NbtList posNbt = new NbtList();
-        posNbt.add(NbtDouble.of(entity.getX()));
-        posNbt.add(NbtDouble.of(entity.getY()));
-        posNbt.add(NbtDouble.of(entity.getZ()));
-        nbt.put("Pos", posNbt);
-
-        // Motion
-        NbtList motionNbt = new NbtList();
-        motionNbt.add(NbtDouble.of(entity.getVelocity().x));
-        motionNbt.add(NbtDouble.of(entity.getVelocity().y));
-        motionNbt.add(NbtDouble.of(entity.getVelocity().z));
-        nbt.put("Motion", motionNbt);
-
-        // Rotation
-        NbtList rotationNbt = new NbtList();
-        rotationNbt.add(NbtFloat.of(entity.getYaw()));
-        rotationNbt.add(NbtFloat.of(entity.getPitch()));
-        nbt.put("Rotation", rotationNbt);
-
-        // UUID
-        nbt.putIntArray("UUID", new int[]{
-                (int)(entity.getUuid().getMostSignificantBits() >> 32),
-                (int) entity.getUuid().getMostSignificantBits(),
-                (int)(entity.getUuid().getLeastSignificantBits() >> 32),
-                (int) entity.getUuid().getLeastSignificantBits()
-        });
-
-        // Common flags
-        nbt.putBoolean("OnGround", entity.isOnGround());
-        nbt.putBoolean("Invulnerable", entity.isInvulnerable());
-        nbt.putInt("PortalCooldown", entity.getPortalCooldown());
-        nbt.putBoolean("NoGravity", entity.hasNoGravity());
-        nbt.putBoolean("Glowing", entity.isGlowing());
-        nbt.putBoolean("Silent", entity.isSilent());
-
-        // Custom name
-        if (entity.hasCustomName() && entity.getCustomName() != null) {
-            String customNameJson = net.minecraft.text.TextCodecs.CODEC
-                    .encodeStart(
-                            net.minecraft.registry.RegistryOps.of(
-                                    com.mojang.serialization.JsonOps.INSTANCE,
-                                    client.world.getRegistryManager()),
-                            entity.getCustomName())
-                    .result()
-                    .map(e -> e.toString())
-                    .orElse("\"\"");
-            nbt.putString("CustomName", customNameJson);
-            nbt.putBoolean("CustomNameVisible", entity.isCustomNameVisible());
-        }
-
-        // Living entity data
-        if (entity instanceof LivingEntity living) {
-            addLivingEntityData(nbt, living, client);
-        }
-
-        // ItemEntity data
-        if (entity instanceof ItemEntity itemEntity) {
-            addItemEntityData(nbt, itemEntity, client);
-        }
-
-        return nbt;
-    }
-
-    private static void addLivingEntityData(NbtCompound nbt, LivingEntity living,
-                                             MinecraftClient client) {
-        nbt.putFloat("Health", living.getHealth());
-        nbt.putFloat("AbsorptionAmount", living.getAbsorptionAmount());
-        nbt.putShort("HurtTime", (short) living.hurtTime);
-        nbt.putShort("DeathTime", (short) living.deathTime);
-        nbt.putFloat("HurtByTimestamp", 0);
-        nbt.putBoolean("Invulnerable", living.isInvulnerable());
-
-        // Hand and armor items
-        NbtList handItems = new NbtList();
-        for (var stack : List.of(living.getMainHandStack(), living.getOffHandStack())) {
-            NbtCompound itemNbt = new NbtCompound();
-            itemNbt.putString("id", Registries.ITEM.getId(stack.getItem()).toString());
-            itemNbt.putByte("Count", (byte) stack.getCount());
-            handItems.add(itemNbt);
-        }
-        nbt.put("HandItems", handItems);
-
-        NbtList armorItems = new NbtList();
-        for (var slot : List.of(net.minecraft.entity.EquipmentSlot.FEET, net.minecraft.entity.EquipmentSlot.LEGS,
-                net.minecraft.entity.EquipmentSlot.CHEST, net.minecraft.entity.EquipmentSlot.HEAD)) {
-            var stack = living.getEquippedStack(slot);
-            NbtCompound itemNbt = new NbtCompound();
-            itemNbt.putString("id", Registries.ITEM.getId(stack.getItem()).toString());
-            itemNbt.putByte("Count", (byte) stack.getCount());
-            armorItems.add(itemNbt);
-        }
-        nbt.put("ArmorItems", armorItems);
-
-        NbtList handDropChances = new NbtList();
-        handDropChances.add(NbtFloat.of(0.085f));
-        handDropChances.add(NbtFloat.of(0.085f));
-        nbt.put("HandDropChances", handDropChances);
-
-        NbtList armorDropChances = new NbtList();
-        for (int i = 0; i < 4; i++) armorDropChances.add(NbtFloat.of(0.085f));
-        nbt.put("ArmorDropChances", armorDropChances);
-
-        // Mob data
-        if (living instanceof MobEntity mob) {
-            nbt.putBoolean("PersistenceRequired", mob.isPersistent());
-            nbt.putBoolean("LeftHanded", mob.isLeftHanded());
-            nbt.putBoolean("CanPickUpLoot", mob.canPickUpLoot());
-        }
-
-        // Animal data
-        if (living instanceof AnimalEntity animal) {
-            nbt.putInt("InLove", animal.getLoveTicks());
-            nbt.putInt("Age", animal.getBreedingAge());
-            if (animal.getLovingPlayer() != null) {
-                nbt.putIntArray("LoveCause", new int[]{
-                        (int)(animal.getLovingPlayer().getUuid().getMostSignificantBits() >> 32),
-                        (int) animal.getLovingPlayer().getUuid().getMostSignificantBits(),
-                        (int)(animal.getLovingPlayer().getUuid().getLeastSignificantBits() >> 32),
-                        (int) animal.getLovingPlayer().getUuid().getLeastSignificantBits()
-                });
+    /** Erfasst die Entities eines einzelnen Chunks (z. B. kurz bevor er entladen wird). */
+    public static void captureChunk(ClientWorld world, ChunkPos pos) {
+        if (world == null) return;
+        for (Entity entity : world.getEntities()) {
+            if (entity.getChunkPos().equals(pos)) {
+                capture(world, entity);
             }
         }
     }
 
-    private static void addItemEntityData(NbtCompound nbt, ItemEntity itemEntity,
-                                           MinecraftClient client) {
-        var stack = itemEntity.getStack();
-        NbtCompound itemNbt = new NbtCompound();
-        itemNbt.putString("id", Registries.ITEM.getId(stack.getItem()).toString());
-        itemNbt.putByte("Count", (byte) stack.getCount());
-        nbt.put("Item", itemNbt);
-        nbt.putShort("PickupDelay", (short) 10);
+    private static void capture(ClientWorld world, Entity entity) {
+        // Spieler gehören nicht in die Entity-Dateien (Vanilla speichert sie dort auch nicht)
+        if (entity instanceof PlayerEntity) return;
+        try {
+            NbtWriteView view = NbtWriteView.create(ErrorReporter.EMPTY, world.getRegistryManager());
+            // saveData() lässt Reiter aus — die werden vom Fahrzeug als "Passengers" mitgespeichert
+            if (!entity.saveData(view)) return;
+            cache.computeIfAbsent(world.getRegistryKey(), k -> new ConcurrentHashMap<>())
+                    .put(entity.getUuid(), new Captured(entity.getChunkPos(), view.getNbt()));
+        } catch (Throwable t) {
+            System.out.println("[WorldDownloader] Failed to save entity " + entity + ": " + t.getMessage());
+        }
     }
 
-    public static Map<ChunkPos, List<NbtCompound>> getAll() {
-        return entities;
+    public static Map<RegistryKey<World>, Map<UUID, Captured>> drain() {
+        var old = cache;
+        cache = new ConcurrentHashMap<>();
+        return old;
     }
 
-    public static List<NbtCompound> getEntitiesForChunk(ChunkPos chunkPos) {
-        List<NbtCompound> result = entities.getOrDefault(chunkPos, new ArrayList<>());
-        System.out.println(" Retrieved " + result.size() + " entities for chunk " + chunkPos.x + "," + chunkPos.z);
-        return result;
+    /** Schreibt entities/r.X.Z.mca pro Dimension im Vanilla-Format (vgl. EntityChunkDataAccess). */
+    public static void writeEntities(Path worldFolder, Map<RegistryKey<World>, Map<UUID, Captured>> entities) throws IOException {
+        for (var dim : entities.entrySet()) {
+            Map<ChunkPos, NbtList> byChunk = new HashMap<>();
+            for (Captured c : dim.getValue().values()) {
+                byChunk.computeIfAbsent(c.chunk(), k -> new NbtList()).add(c.nbt());
+            }
+
+            Map<ChunkPos, NbtCompound> chunks = new HashMap<>();
+            byChunk.forEach((pos, list) -> {
+                NbtCompound chunk = NbtHelper.putDataVersion(new NbtCompound());
+                chunk.put("Entities", list);
+                chunk.put("Position", ChunkPos.CODEC, pos);
+                chunks.put(pos, chunk);
+            });
+
+            Path dir = DimensionType.getSaveDirectory(dim.getKey(), worldFolder).resolve("entities");
+            ChunkListener.writeGroupedByRegion(dir, chunks);
+        }
     }
 
     public static int getTotalTrackedEntities() {
-        return entities.values().stream().mapToInt(List::size).sum();
+        return cache.values().stream().mapToInt(Map::size).sum();
     }
 
     public static void clear() {
-        int count = getTotalTrackedEntities();
-        entities.clear();
-        System.out.println(" Cleared " + count + " tracked entities");
+        cache = new ConcurrentHashMap<>();
     }
 }

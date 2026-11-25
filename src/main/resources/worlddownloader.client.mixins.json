@@ -4,17 +4,14 @@
   "compatibilityLevel": "JAVA_21",
   "client": [
     "ClientChunkManagerMixin",
-    "BlockInteractionMixin",
-    "ChunkDataPacketAccessor",
     "ContainerMixin",
     "HandledScreenMixin",
-    "DebugContainerMixin",
+    "LevelStorageMixin",
+    "MinecraftClientMixin",
     "SelectWorldScreenMixin",
+    "ServerResourcePackManagerMixin",
     "TitleScreenMixin",
     "WorldEntryMixin",
-    "LevelStorageMixin",
-    "ClientPlayNetworkHandlerMixin",
-    "ServerResourcePackManagerMixin",
     "WorldListWidgetMixin"
   ],
   "injectors": {

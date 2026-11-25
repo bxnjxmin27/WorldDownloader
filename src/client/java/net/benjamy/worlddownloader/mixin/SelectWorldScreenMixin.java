@@ -27,9 +27,9 @@ public abstract class SelectWorldScreenMixin extends Screen {
 
     @Inject(method = "init", at = @At("HEAD"))
     private void onInitHead(CallbackInfo ci) {
-        this.title = WorldFolderManager.isDownloadedWorldsActive()
-                ? Text.literal("Downloaded Worlds")
-                : Text.literal("Normal Worlds");
+        if (WorldFolderManager.isDownloadedWorldsActive()) {
+            this.title = Text.translatable("worlddownloader.gui.downloaded_worlds");
+        }
     }
 
     @Inject(method = "init", at = @At("TAIL"))

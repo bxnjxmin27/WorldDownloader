@@ -42,6 +42,16 @@ Exports land in `.minecraft/downloaded_worlds/Export_<date>/` and show up under 
 
 The jar ends up in `build/libs/`. To copy it straight into a mods folder, set `wdModsDir=/path/to/.minecraft/mods` in `~/.gradle/gradle.properties` and run `./gradlew installMod`.
 
+## Testing
+
+An automated end-to-end client gametest creates a world, records it, exports it and loads the export again
+(chest contents, biomes at every height, entities, enchanted inventory, auto-export on leave):
+
+```bash
+./gradlew runClientGameTest                # opens a game window
+xvfb-run -a ./gradlew runClientGameTest    # headless on Linux
+```
+
 ## License
 
 [MIT](LICENSE) © benjamy

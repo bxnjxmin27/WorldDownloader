@@ -1,302 +1,117 @@
 package net.benjamy.worlddownloader.util;
 
+import net.benjamy.worlddownloader.config.ModConfig;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
-import net.minecraft.block.Block;
+import net.minecraft.block.BlockState;
 import net.minecraft.block.ChestBlock;
+import net.minecraft.block.EnderChestBlock;
 import net.minecraft.block.enums.ChestType;
-import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.world.ClientWorld;
-import net.minecraft.item.ItemStack;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.inventory.StackWithSlot;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtList;
 import net.minecraft.nbt.NbtOps;
-import net.minecraft.screen.ScreenHandlerType;
+import net.minecraft.screen.ScreenHandler;
+import net.minecraft.screen.slot.Slot;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.ChunkPos;
-import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.GlobalPos;
+import net.minecraft.world.World;
 import net.minecraft.world.chunk.WorldChunk;
-import net.benjamy.worlddownloader.config.ModConfig;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Merkt sich Container-Inhalte (Kisten, Fässer, Öfen …), sobald der Spieler sie öffnet.
+ * Der Server schickt Inhalte nur beim Öffnen — deshalb wird beim Schließen aus den Container-Slots gelesen.
+ */
 @Environment(EnvType.CLIENT)
 public class ContainerTracker {
 
-    // syncId -> ContainerData
-    private static final Map<Integer, ContainerData> openContainers = new ConcurrentHashMap<>();
-    // BlockPos -> saved NBT
-    private static final Map<BlockPos, NbtCompound> savedContainerData = new ConcurrentHashMap<>();
+    /** syncId → Position des geöffneten Blocks */
+    private static final Map<Integer, GlobalPos> openContainers = new ConcurrentHashMap<>();
+    /** Position → gespeicherte Items (Vanilla-Format: Liste aus {Slot, id, count, components}) */
+    private static final Map<GlobalPos, NbtList> savedItems = new ConcurrentHashMap<>();
+    /** Inhalt der Enderkiste — gehört dem Spieler, nicht dem Block */
+    private static volatile NbtList enderItems;
 
-    public static void onContainerOpened(int syncId, ScreenHandlerType<?> type) {
-        System.out.println(" Container opened at syncId=" + syncId);
-        openContainers.put(syncId, new ContainerData(syncId));
+    public static void onContainerOpened(int syncId, ClientWorld world, BlockPos pos) {
+        if (!ModConfig.getInstance().isSaveContainers() || world == null || pos == null) return;
+        openContainers.put(syncId, GlobalPos.create(world.getRegistryKey(), pos.toImmutable()));
     }
 
-    public static void setBlockPos(int syncId, BlockPos pos) {
-        ContainerData data = openContainers.get(syncId);
-        if (data != null) {
-            data.blockPos = pos;
-            System.out.println("[WD] Set blockPos for syncId=" + syncId + " to " + pos);
+    public static void onContainerClosed(ScreenHandler handler, ClientWorld world) {
+        GlobalPos target = openContainers.remove(handler.syncId);
+        if (target == null || world == null || world.getRegistryKey() != target.dimension()) return;
+
+        // Nur Container-Slots, nicht das Spielerinventar. slot.getIndex() = Index im Container-Inventar.
+        List<StackWithSlot> stacks = new ArrayList<>();
+        for (Slot slot : handler.slots) {
+            if (slot.inventory instanceof PlayerInventory) continue;
+            stacks.add(new StackWithSlot(slot.getIndex(), slot.getStack().copy()));
+        }
+
+        BlockPos pos = target.pos();
+        BlockState state = world.getBlockState(pos);
+
+        if (state.getBlock() instanceof EnderChestBlock) {
+            enderItems = encode(world, stacks, 0, 27);
+        } else if (state.getBlock() instanceof ChestBlock && state.get(ChestBlock.CHEST_TYPE) != ChestType.SINGLE
+                && stacks.size() >= 54) {
+            // Doppelkiste: Vanilla-DoubleInventory = (RIGHT-Hälfte: Slots 0–26, LEFT-Hälfte: Slots 27–53)
+            BlockPos other = pos.offset(ChestBlock.getFacing(state));
+            boolean isRight = state.get(ChestBlock.CHEST_TYPE) == ChestType.RIGHT;
+            BlockPos rightPos = isRight ? pos : other;
+            BlockPos leftPos = isRight ? other : pos;
+            save(world, rightPos, encode(world, stacks, 0, 27));
+            save(world, leftPos, encode(world, stacks, 27, 54));
+        } else {
+            save(world, pos, encode(world, stacks, 0, Integer.MAX_VALUE));
         }
     }
 
-    public static void onContainerClosed(int syncId, ClientWorld world) {
-        // Prüfen ob Container-Speichern aktiviert ist
-        if (!ModConfig.getInstance().isSaveContainers()) {
-            openContainers.remove(syncId);
-            System.out.println(" Container closed - not saving (SaveContainers disabled)");
-            return;
+    private static NbtList encode(ClientWorld world, List<StackWithSlot> stacks, int from, int to) {
+        var ops = world.getRegistryManager().getOps(NbtOps.INSTANCE);
+        NbtList list = new NbtList();
+        for (StackWithSlot s : stacks) {
+            if (s.stack().isEmpty() || s.slot() < from || s.slot() >= to) continue;
+            StackWithSlot shifted = new StackWithSlot(s.slot() - from, s.stack());
+            StackWithSlot.CODEC.encodeStart(ops, shifted).result().ifPresent(list::add);
         }
+        return list;
+    }
 
-        ContainerData data = openContainers.remove(syncId);
-        if (data == null) return;
+    private static void save(ClientWorld world, BlockPos pos, NbtList items) {
+        savedItems.put(GlobalPos.create(world.getRegistryKey(), pos.toImmutable()), items);
+        // Chunk sofort neu erfassen, damit die Items im Cache landen
+        WorldChunk chunk = world.getChunk(pos.getX() >> 4, pos.getZ() >> 4);
+        ChunkListener.capture(world, chunk);
+    }
 
-        if (world == null || data.blockPos == null) {
-            System.out.println(" Container closed at syncId=" + syncId + " (no world/pos)");
-            return;
+    /** Wird beim Serialisieren jedes Block-Entities aufgerufen und ergänzt gespeicherte Items. */
+    public static NbtCompound applySavedItems(World world, BlockPos pos, NbtCompound blockEntityNbt) {
+        NbtList items = savedItems.get(GlobalPos.create(world.getRegistryKey(), pos));
+        if (items != null) {
+            blockEntityNbt.put("Items", items.copy());
         }
-
-        System.out.println(" Container closed at " + data.blockPos);
-        try {
-            var blockState = world.getBlockState(data.blockPos);
-            Block block = blockState.getBlock();
-
-            if (block instanceof ChestBlock || block instanceof net.minecraft.block.TrappedChestBlock) {
-                handleDoubleChest(world, data, blockState);
-            } else {
-                handleRegularContainer(data);
-            }
-        } catch (Exception e) {
-            System.out.println(" Failed to handle double chest, falling back to regular container: " + e.getMessage());
-            handleRegularContainer(data);
-        }
+        return blockEntityNbt;
     }
 
-    private static void handleDoubleChest(ClientWorld world, ContainerData data,
-                                           net.minecraft.block.BlockState blockState) {
-        try {
-            ChestType chestType = blockState.get(ChestBlock.CHEST_TYPE);
-            Direction facing = blockState.get(ChestBlock.FACING);
-            Direction adjacentDirection = (chestType == ChestType.LEFT)
-                    ? facing.rotateYClockwise()
-                    : facing.rotateYCounterclockwise();
-
-            if (chestType == ChestType.SINGLE) {
-                handleRegularContainer(data);
-                return;
-            }
-
-            // RIGHT-Block bekommt immer Slots 0–26, LEFT-Block bekommt Slots 27–53
-            BlockPos rightPos, leftPos;
-            if (chestType == ChestType.RIGHT) {
-                rightPos = data.blockPos;
-                leftPos = data.blockPos.offset(adjacentDirection);
-            } else {
-                leftPos = data.blockPos;
-                rightPos = data.blockPos.offset(adjacentDirection);
-            }
-
-            List<ItemStack> rightItems = data.getItemsRange(0, 27);
-            List<ItemStack> leftItems = data.getItemsRange(27, 54);
-
-            NbtCompound rightNbt = buildChestNbt(rightPos, rightItems, ChestType.RIGHT, facing);
-            NbtCompound leftNbt = buildChestNbt(leftPos, leftItems, ChestType.LEFT, facing);
-
-            savedContainerData.put(rightPos, rightNbt);
-            savedContainerData.put(leftPos, leftNbt);
-
-            long rightNonEmpty = rightItems.stream().filter(s -> !s.isEmpty()).count();
-            long leftNonEmpty = leftItems.stream().filter(s -> !s.isEmpty()).count();
-            System.out.println(" Saved double chest:");
-            System.out.println("    - Right chest at " + rightPos + " with " + rightNonEmpty + " filled slots");
-            System.out.println("    - Left chest at " + leftPos + " with " + leftNonEmpty + " filled slots");
-
-            resaveChunkForPos(rightPos);
-            resaveChunkForPos(leftPos);
-        } catch (Exception e) {
-            System.out.println(" Failed to handle double chest, falling back to regular container: " + e.getMessage());
-            handleRegularContainer(data);
-        }
-    }
-
-    private static void handleRegularContainer(ContainerData data) {
-        if (data.blockPos == null) return;
-        NbtCompound nbt = data.toNbt();
-        if (nbt != null) {
-            savedContainerData.put(data.blockPos, nbt);
-            long nonEmpty = data.getAllItems().stream().filter(s -> !s.isEmpty()).count();
-            System.out.println(" Saved regular container at " + data.blockPos + " with " + nonEmpty + " filled slots");
-            resaveChunkForPos(data.blockPos);
-        }
-    }
-
-    /**
-     * Serialisiert den Chunk neu und aktualisiert den ChunkListener-Cache.
-     * Nötig weil der Cache beim ersten Chunk-Load befüllt wurde — vor dem Container-Open.
-     * ClientChunkSerializer.serialize() ruft enhanceBlockEntityWithContainerData() auf,
-     * sodass der neue Cache-Eintrag die Kisten-Items enthält.
-     */
-    private static void resaveChunkForPos(BlockPos pos) {
-        MinecraftClient mc = MinecraftClient.getInstance();
-        if (mc.world == null) return;
-        ChunkPos chunkPos = new ChunkPos(pos);
-        WorldChunk chunk = mc.world.getChunk(chunkPos.x, chunkPos.z);
-        NbtCompound nbt = ClientChunkSerializer.serialize(mc.world, chunk);
-        ChunkListener.addChunkNbt(chunkPos, nbt);
-        System.out.println("[WD] Re-serialized chunk " + chunkPos + " after container close");
-    }
-
-    private static NbtCompound buildChestNbt(BlockPos pos, List<ItemStack> items,
-                                              ChestType chestType, Direction facing) {
-        NbtCompound nbt = new NbtCompound();
-        var mc = MinecraftClient.getInstance();
-        var blockEntity = mc.world != null ? mc.world.getBlockEntity(pos) : null;
-        String id = blockEntity != null
-                ? net.minecraft.registry.Registries.BLOCK_ENTITY_TYPE.getId(blockEntity.getType()).toString()
-                : "minecraft:chest";
-        nbt.putString("id", id);
-        nbt.putInt("x", pos.getX());
-        nbt.putInt("y", pos.getY());
-        nbt.putInt("z", pos.getZ());
-        nbt.putBoolean("keepPacked", false);
-
-        var lookup = mc.world != null ? mc.world.getRegistryManager() : null;
-
-        NbtList itemsList = new NbtList();
-        for (int i = 0; i < items.size(); i++) {
-            ItemStack stack = items.get(i);
-            if (!stack.isEmpty() && lookup != null) {
-                final byte slotByte = (byte) i;
-                var result = ItemStack.CODEC.encodeStart(lookup.getOps(NbtOps.INSTANCE), stack).result();
-                result.ifPresent(el -> {
-                    NbtCompound itemNbt = (NbtCompound) el;
-                    itemNbt.putByte("Slot", slotByte);
-                    itemsList.add(itemNbt);
-                });
-            }
-        }
-        nbt.put("Items", itemsList);
-        return nbt;
-    }
-
-    public static void onInventoryUpdate(int syncId, List<ItemStack> stacks) {
-        ContainerData data = openContainers.get(syncId);
-        if (data == null) return;
-        data.setInventory(stacks);
-        if (data.blockPos != null) {
-            NbtCompound nbt = data.toNbt();
-            if (nbt != null) savedContainerData.put(data.blockPos, nbt);
-        }
-    }
-
-    public static void onSlotUpdate(int syncId, int slot, ItemStack stack) {
-        ContainerData data = openContainers.get(syncId);
-        if (data == null) return;
-        data.updateSlot(slot, stack);
-    }
-
-    public static boolean hasContainerData(BlockPos pos) {
-        return savedContainerData.containsKey(pos);
-    }
-
-    public static NbtCompound getContainerData(BlockPos pos) {
-        return savedContainerData.get(pos);
-    }
-
-    public static NbtCompound enhanceBlockEntityWithContainerData(BlockPos pos, NbtCompound original) {
-        NbtCompound saved = savedContainerData.get(pos);
-        if (saved == null) return original;
-
-        NbtCompound enhanced = original.copy();
-        if (saved.contains("Items")) {
-            enhanced.put("Items", saved.get("Items"));
-        }
-        System.out.println(" Enhanced block entity at " + pos);
-        return enhanced;
+    public static NbtList getEnderItems() {
+        return enderItems;
     }
 
     public static int getTotalSavedContainers() {
-        return savedContainerData.size();
+        return savedItems.size();
     }
 
     public static void clear() {
         openContainers.clear();
-        savedContainerData.clear();
-        System.out.println(" Cleared all container data");
-    }
-
-    // -------------------------------------------------------------------------
-
-    public static class ContainerData {
-        private final int syncId;
-        public BlockPos blockPos;
-        private final Map<Integer, ItemStack> containerSlots = new ConcurrentHashMap<>();
-
-        public ContainerData(int syncId) {
-            this.syncId = syncId;
-        }
-
-        public void setInventory(List<ItemStack> stacks) {
-            for (int i = 0; i < stacks.size(); i++) {
-                containerSlots.put(i, stacks.get(i).copy());
-            }
-        }
-
-        public void updateSlot(int slot, ItemStack stack) {
-            containerSlots.put(slot, stack.copy());
-        }
-
-        public int getSlotCount() {
-            return containerSlots.isEmpty() ? 0 : containerSlots.keySet().stream().max(Integer::compare).orElse(0) + 1;
-        }
-
-        public List<ItemStack> getAllItems() {
-            int max = getSlotCount();
-            return java.util.stream.IntStream.range(0, max)
-                    .mapToObj(i -> containerSlots.getOrDefault(i, ItemStack.EMPTY))
-                    .toList();
-        }
-
-        public List<ItemStack> getItemsRange(int from, int to) {
-            return java.util.stream.IntStream.range(from, to)
-                    .mapToObj(i -> containerSlots.getOrDefault(i, ItemStack.EMPTY))
-                    .toList();
-        }
-
-        public NbtCompound toNbt() {
-            if (blockPos == null) return null;
-            var mc = MinecraftClient.getInstance();
-            if (mc.world == null) return null;
-            var lookup = mc.world.getRegistryManager();
-
-            var blockEntity = mc.world.getBlockEntity(blockPos);
-            String id = blockEntity != null
-                    ? net.minecraft.registry.Registries.BLOCK_ENTITY_TYPE.getId(blockEntity.getType()).toString()
-                    : "minecraft:chest";
-
-            NbtCompound nbt = new NbtCompound();
-            nbt.putString("id", id);
-            nbt.putInt("x", blockPos.getX());
-            nbt.putInt("y", blockPos.getY());
-            nbt.putInt("z", blockPos.getZ());
-            nbt.putBoolean("keepPacked", false);
-
-            NbtList itemsList = new NbtList();
-            containerSlots.forEach((slot, stack) -> {
-                if (!stack.isEmpty()) {
-                    var result = ItemStack.CODEC.encodeStart(lookup.getOps(NbtOps.INSTANCE), stack).result();
-                    result.ifPresent(el -> {
-                        NbtCompound itemNbt = (NbtCompound) el;
-                        itemNbt.putByte("Slot", (byte) (int) slot);
-                        itemsList.add(itemNbt);
-                    });
-                }
-            });
-            nbt.put("Items", itemsList);
-            return nbt;
-        }
+        savedItems.clear();
+        enderItems = null;
     }
 }
